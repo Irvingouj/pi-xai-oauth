@@ -5,8 +5,12 @@ import { MODELS } from "./xai/models";
 import { createXaiOAuth } from "./xai/oauth";
 import { streamSimpleXaiResponses } from "./xai/responses";
 import { registerXaiTools } from "./xai/tools";
-import { syncCursorToolShimsForModel } from "./xai/tools/cursor-shims";
 
+/**
+ * Local fork intent: OAuth + Grok 4.5 (and other API models) for pi.
+ * No Cursor/Grok CLI tool shims — use pi's native grep/bash/read/…
+ * Want Composer? Use Grok CLI, not this package.
+ */
 export default function (pi: ExtensionAPI) {
   pi.registerProvider(XAI_PROVIDER_ID, {
     name: "xAI (OAuth)",
@@ -19,14 +23,4 @@ export default function (pi: ExtensionAPI) {
   });
 
   registerXaiTools(pi);
-
-  if (typeof (pi as any).on === "function") {
-    // Active-tool accessors belong to the ExtensionAPI (`pi`), while models
-    // are supplied by the event/context payload.
-    (pi as any).on("session_start", (_event: any, ctx: any) => syncCursorToolShimsForModel(pi, ctx?.model));
-    (pi as any).on("model_select", (event: any, ctx: any) =>
-      syncCursorToolShimsForModel(pi, event?.model ?? ctx?.model),
-    );
-    (pi as any).on("before_agent_start", (_event: any, ctx: any) => syncCursorToolShimsForModel(pi, ctx?.model));
-  }
 }

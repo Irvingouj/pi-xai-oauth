@@ -10,4 +10,5 @@ build/
 *.pem
 *.key
 auth.json
-*.local
+*.local.tmp*
+.tmp-empty-home-for-tests/

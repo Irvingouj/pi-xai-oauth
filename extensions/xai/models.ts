@@ -38,32 +38,8 @@ export const MODELS = [
     contextWindow: 1_000_000,
     maxTokens: 131_072,
   },
-  {
-    id: "grok-build",
-    name: "Grok Build",
-    reasoning: true,
-    input: ["text", "image"],
-    cost: { input: 1, output: 2, cacheRead: 0.2, cacheWrite: 0.2 },
-    contextWindow: 512_000,
-    maxTokens: 30_000,
-  },
-  {
-    id: "grok-composer-2.5-fast",
-    name: "Composer 2.5 Fast",
-    reasoning: false,
-    input: ["text", "image"],
-    cost: { input: 3, output: 15, cacheRead: 0.5, cacheWrite: 0 },
-    contextWindow: 200_000,
-    maxTokens: 30_000,
-    thinkingLevelMap: {
-      off: "none",
-      minimal: null,
-      low: null,
-      medium: null,
-      high: null,
-      xhigh: null,
-    },
-  },
+  // grok-build / grok-composer-2.5-fast removed in this local fork:
+  // they require Cursor-style tools + Grok CLI proxy. Use Grok CLI for those.
   {
     id: "grok-4.20-0309-reasoning",
     name: "Grok 4.20 Reasoning",

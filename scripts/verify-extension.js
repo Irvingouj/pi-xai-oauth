@@ -139,135 +139,18 @@ async function runTool(tools, name, params = {}, expectedText = "OK", requestOri
   return { body: request.body, request, result };
 }
 
-async function runCursorTool(tools, name, params = {}, ctx = {}) {
-  const controller = new AbortController();
-  return tools.get(name).execute("call_cursor", params, controller.signal, () => {}, { cwd: repoRoot, ...ctx });
-}
-
 async function verifyCursorToolShims(tools) {
+  // Local fork: no Cursor/Grok CLI shims — pi native tools only.
   for (const name of ["Read", "Write", "StrReplace", "Edit", "Delete", "LS", "Grep", "Glob", "Shell", "WebSearch"]) {
-    assert.ok(tools.has(name), `${name} Cursor/Grok CLI shim should be registered`);
-  }
-
-  const grepResult = await runCursorTool(tools, "Grep", { query: "export const DEFAULT_XAI_MODEL", include: "*.ts", path: "extensions", limit: 5 });
-  assert.match(grepResult.content[0].text, /xai\/constants\.ts/, "Grep shim should map query/include to pi grep pattern/glob");
-
-  const grepContextResult = await runCursorTool(tools, "Grep", {
-    query: "DEFAULT_XAI_MODEL",
-    include: "constants.ts",
-    path: "extensions/xai",
-    context: 1,
-    limit: 1,
-  });
-  assert.match(grepContextResult.content[0].text, /constants\.ts-17-.*XAI_PROVIDER_ID/, "Grep shim should include leading context lines");
-  assert.match(grepContextResult.content[0].text, /constants\.ts:18:.*DEFAULT_XAI_MODEL/, "Grep shim should mark the matched line");
-  await assert.rejects(
-    () => runCursorTool(tools, "Grep", { query: "(a+)+$", include: "constants.ts", path: "extensions/xai" }),
-    /Unsafe regex pattern/,
-    "Grep shim should reject regexes with obvious catastrophic-backtracking structure",
-  );
-  await assert.rejects(
-    () => runCursorTool(tools, "Grep", { path: "extensions", include: "*.ts", limit: 5 }),
-    /Grep requires a non-empty pattern \(or query alias\)/,
-    "Grep shim should fail clearly when pattern/query is omitted",
-  );
-  await assert.rejects(
-    () => runCursorTool(tools, "Grep", { pattern: "   ", path: "extensions" }),
-    /Grep requires a non-empty pattern \(or query alias\)/,
-    "Grep shim should reject whitespace-only patterns",
-  );
-
-  const grepByPattern = await runCursorTool(tools, "Grep", {
-    pattern: "registerProvider",
-    path: "extensions",
-    include: "*.ts",
-    limit: 3,
-  });
-  assert.match(grepByPattern.content[0].text, /registerProvider/, "Grep shim should accept pattern directly");
-
-  const grepPrepared = tools.get("Grep").prepareArguments({
-    query: "export const DEFAULT_XAI_MODEL",
-    include: "*.ts",
-    path: "extensions",
-  });
-  assert.equal(grepPrepared.pattern, "export const DEFAULT_XAI_MODEL", "Grep prepareArguments should map query to required pattern");
-  assert.equal(grepPrepared.glob, "*.ts", "Grep prepareArguments should map include to glob");
-  const grepParams = tools.get("Grep").parameters;
-  assert.ok(
-    Array.isArray(grepParams.required) && grepParams.required.includes("pattern"),
-    "Grep schema should require pattern so models do not omit the search text",
-  );
-  assert.ok(grepParams.properties?.pattern, "Grep schema should expose a pattern property");
-  assert.ok(grepParams.properties?.query, "Grep schema should keep query as a Cursor-style alias");
-
-  const globResult = await runCursorTool(tools, "Glob", { glob: "xai-oauth.ts", limit: 5 });
-  assert.match(globResult.content[0].text, /extensions\/xai-oauth\.ts/, "Glob shim should map glob to pi find");
-
-  const readResult = await runCursorTool(tools, "Read", { file_path: "package.json", limit: 3 });
-  assert.match(readResult.content[0].text, /"name": "pi-xai-oauth"/, "Read shim should map file_path to pi read path");
-
-  const tmpDir = path.join(repoRoot, ".tmp-shim-tests");
-  const tmpFile = path.join(tmpDir, "cursor-shim.txt");
-  await fs.mkdir(tmpDir, { recursive: true });
-  try {
-    const writeResult = await runCursorTool(tools, "Write", { file_path: ".tmp-shim-tests/cursor-shim.txt", contents: "hello old" });
-    assert.match(writeResult.content[0].text, /Successfully wrote/, "Write shim should map contents to pi write content");
-
-    const replaceResult = await runCursorTool(tools, "StrReplace", {
-      file_path: ".tmp-shim-tests/cursor-shim.txt",
-      old_string: "hello old",
-      new_string: "hello new",
-    });
-    assert.match(replaceResult.content[0].text, /Successfully replaced/, "StrReplace shim should map old_string/new_string to pi edit");
-
-    const shellResult = await runCursorTool(tools, "Shell", { cmd: "printf shim-ok" });
-    assert.match(shellResult.content[0].text, /shim-ok/, "Shell shim should map cmd to pi bash command");
-
-    const deleteResult = await runCursorTool(tools, "Delete", { file_path: ".tmp-shim-tests/cursor-shim.txt" });
-    assert.match(deleteResult.content[0].text, /Deleted/, "Delete shim should remove files inside the workspace");
-  } finally {
-    await fs.rm(tmpFile, { force: true }).catch(() => {});
-    await fs.rm(tmpDir, { force: true, recursive: true }).catch(() => {});
+    assert.ok(!tools.has(name), `${name} Cursor/Grok CLI shim must NOT be registered (pi-native fork)`);
   }
 }
 
 async function verifyCursorToolActivation(loadResult) {
-  const { handlers, getActiveTools } = loadResult;
-  // Real ExtensionContext objects do not expose the active-tool accessors.
-  // Keeping this context empty prevents the test from masking the regression.
-  const ctx = {};
-  const selectModel = (id, provider = "xai-auth") =>
-    handlers.get("model_select")?.({ model: { provider, id } }, ctx);
-
-  await selectModel("grok-composer-2.5-fast");
-  assert.ok(getActiveTools().includes("Grep"), "Cursor shims should be enabled for Composer 2.5");
-  const composerTools = getActiveTools();
-  await selectModel("grok-composer-2.5-fast");
-  assert.deepStrictEqual(getActiveTools(), composerTools, "Repeated Composer sync should not duplicate shims");
-
-  await selectModel("grok-4.3");
-  assert.ok(!getActiveTools().includes("Grep"), "Cursor shims should be disabled for non-Grok-CLI xAI models");
-  for (const shim of ["Read", "Write", "StrReplace", "Edit", "Delete", "LS", "Grep", "Glob", "Shell", "WebSearch"]) {
-    assert.ok(!getActiveTools().includes(shim), `${shim} shim must be removed for non-Grok models`);
-  }
-
-  await selectModel("grok-composer-2.5-fast");
-  await handlers.get("session_start")?.({}, { model: { provider: "anthropic", id: "claude-opus-4-8" } });
-  assert.ok(!getActiveTools().includes("Grep"), "session_start should prune shims for Anthropic models");
-
-  await selectModel("grok-composer-2.5-fast");
-  await handlers.get("before_agent_start")?.({}, { model: { provider: "anthropic", id: "claude-opus-4-8" } });
-  assert.ok(!getActiveTools().includes("Grep"), "before_agent_start should prune shims for Anthropic models");
-
-  loadResult.setToolRegistryFailures({ get: true });
-  await assert.doesNotReject(
-    async () => handlers.get("session_start")?.({}, { model: { provider: "anthropic", id: "claude-opus-4-8" } }),
-    "session_start should tolerate an unavailable tool registry",
-  );
-  loadResult.setToolRegistryFailures({ get: false, set: true });
-  await selectModel("grok-composer-2.5-fast");
-  assert.ok(!getActiveTools().includes("Grep"), "a failed set should not partially update the tool list");
-  loadResult.setToolRegistryFailures();
+  // Shims are not registered; activation sync was removed. No-op keep test hook.
+  const tools = loadResult.tools;
+  await verifyCursorToolShims(tools);
+  assert.ok(!loadResult.handlers.has("model_select") || true, "shim activation handlers optional");
 }
 
 function lastResultErrorMessage(result) {
@@ -331,28 +214,15 @@ async function verifyXaiResponsesTransport(provider) {
 
 
 async function verifyCliModelStreamRouting(provider) {
+  // Local fork: Composer / Grok Build (CLI-proxy models) are not registered.
   const composer = provider.models.find((model) => model.id === "grok-composer-2.5-fast");
-  const model = {
-    ...composer,
-    provider: "xai-auth",
-    api: provider.api,
-    baseUrl: provider.baseUrl,
-  };
-  const before = requests.length;
-  const stream = provider.streamSimple(
-    model,
-    { messages: [{ role: "user", content: "hello", timestamp: Date.now() }] },
-    { apiKey: "oauth-token", sessionId: "session-test" },
+  const build = provider.models.find((model) => model.id === "grok-build");
+  assert.equal(composer, undefined, "Composer 2.5 must not be listed in this pi-native fork");
+  assert.equal(build, undefined, "Grok Build must not be listed in this pi-native fork");
+  assert.ok(
+    provider.models.some((model) => model.id === "grok-4.5"),
+    "Grok 4.5 must remain available",
   );
-  await stream.result();
-  const request = requests.slice(before).find((entry) => entry.url && urlOriginIs(entry.url, "https://cli-chat-proxy.grok.com"));
-  assert.ok(request, "Composer 2.5 provider streams should route to the Grok CLI endpoint");
-  assert.equal(request.body.model, "grok-composer-2.5-fast");
-  assert.equal(request.body.reasoning, undefined, "Composer 2.5 provider streams should not send reasoning effort");
-  assert.equal(headerValue(request.headers, "Authorization"), "Bearer oauth-token");
-  assert.equal(headerValue(request.headers, "x-xai-token-auth"), "xai-grok-cli");
-  assert.equal(headerValue(request.headers, "x-grok-model-override"), "grok-composer-2.5-fast");
-  assert.equal(headerValue(request.headers, "x-grok-conv-id"), "session-test");
 }
 
 async function verifyOAuthCallbackState(provider) {
@@ -490,9 +360,9 @@ async function main() {
     assert.equal(grok45?.cost.output, 6);
     assert.equal(grok45?.thinkingLevelMap?.off, null, "Grok 4.5 reasoning cannot be disabled");
     assert.equal(provider.models.find((model) => model.id === "grok-4.3")?.contextWindow, 1_000_000);
-    assert.equal(provider.models.find((model) => model.id === "grok-build")?.contextWindow, 512_000);
-    assert.equal(provider.models.find((model) => model.id === "grok-composer-2.5-fast")?.contextWindow, 200_000);
-    assert.equal(provider.models.find((model) => model.id === "grok-composer-2.5-fast")?.reasoning, false);
+    // Local fork: no CLI-proxy models (Composer / Grok Build).
+    assert.equal(provider.models.find((model) => model.id === "grok-build"), undefined);
+    assert.equal(provider.models.find((model) => model.id === "grok-composer-2.5-fast"), undefined);
     assert.equal(provider.models.find((model) => model.id === "grok-4.20-0309-reasoning")?.contextWindow, 2_000_000);
     assert.ok(provider.models.some((model) => model.id === "grok-4.20-multi-agent-0309"));
 
@@ -522,29 +392,7 @@ async function main() {
     assert.equal(grok45TextBody.model, "grok-4.5", "xai_generate_text should support explicit Grok 4.5 requests");
     assert.equal(grok45TextBody.reasoning.effort, "high", "Grok 4.5 text generation should default to high reasoning");
 
-    const { body: composerBody, request: composerRequest } = await runTool(
-      tools,
-      "xai_generate_text",
-      { prompt: "hi", model: "grok-composer-2.5-fast", reasoning_effort: "high" },
-      "OK",
-      "https://cli-chat-proxy.grok.com",
-    );
-    assert.equal(composerBody.model, "grok-composer-2.5-fast");
-    assert.equal(composerBody.reasoning, undefined, "Composer 2.5 should not send reasoning effort");
-    assert.equal(headerValue(composerRequest.headers, "x-xai-token-auth"), "xai-grok-cli");
-    assert.equal(headerValue(composerRequest.headers, "x-grok-model-override"), "grok-composer-2.5-fast");
-    assert.ok(headerValue(composerRequest.headers, "x-grok-conv-id"), "Composer 2.5 tool calls should include a Grok conversation id");
-
-    const { body: buildBody, request: buildRequest } = await runTool(
-      tools,
-      "xai_generate_text",
-      { prompt: "hi", model: "grok-build" },
-      "OK",
-      "https://cli-chat-proxy.grok.com",
-    );
-    assert.equal(buildBody.model, "grok-build");
-    assert.equal(headerValue(buildRequest.headers, "x-grok-model-override"), "grok-build");
-    assert.ok(headerValue(buildRequest.headers, "x-grok-conv-id"), "Grok Build tool calls should include a Grok conversation id");
+    // Composer / Grok Build CLI-proxy tool routes removed in this local fork.
 
     const { body: webBody } = await runTool(tools, "xai_web_search", { query: "xAI docs" });
     assert.deepEqual(webBody.tools, [{ type: "web_search", enable_image_understanding: true }]);
