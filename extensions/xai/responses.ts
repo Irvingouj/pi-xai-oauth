@@ -1,4 +1,9 @@
 import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+// IMPORTANT: import transport helpers from the package root, not
+// "@earendil-works/pi-ai/api/...". Pi's extension loader (jiti) aliases
+// "@earendil-works/pi-ai" → dist/compat.js; subpath imports become
+// "compat.js/api/..." and fail at runtime.
+import { streamSimpleOpenAIResponses } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import { isGrokCliProxyModel, xaiBaseUrlForModel, xaiModelForRequest, xaiModelRequestHeaders, xaiResponsesUrlForModel } from "./models";
 import { rewriteXaiResponsesPayload } from "./payload";
@@ -175,8 +180,7 @@ export function streamSimpleXaiResponses(model: Model<Api>, context: Context, op
   const stream = createForwardingAssistantStream();
   void (async () => {
     try {
-      const { streamSimple } = await import("@earendil-works/pi-ai/api/openai-responses");
-      const inner = streamSimple(openAIResponsesModel as Model<"openai-responses">, context, {
+      const inner = streamSimpleOpenAIResponses(openAIResponsesModel as Model<"openai-responses">, context, {
         ...options,
         // Ensure rewriteXaiResponsesPayload can always stamp prompt_cache_key.
         sessionId: sessionId || routingSessionId,
