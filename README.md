@@ -264,23 +264,9 @@ Official xAI sources used for this catalog update:
 
 No Grok 4.5-specific model card, label card, system card, paper, or official max-output-token limit was found in the xAI docs/news/data sources during this update. The package keeps the existing Grok Responses max-token ceiling as a placeholder until xAI publishes official model metadata for that field.
 
-### Composer / Grok Build Tool Compatibility
+### Tool compatibility
 
-Composer 2.5 and Grok Build are trained against Cursor/Grok CLI-style tool names. When either `grok-composer-2.5-fast` or `grok-build` is selected, this package automatically enables compatibility shims that map those tool calls onto pi's built-in tools:
-
-| Cursor/Grok CLI tool | pi tool used underneath |
-|----------------------|-------------------------|
-| `Read` | `read` |
-| `Write` | `write` |
-| `StrReplace` / `Edit` | `edit` |
-| `Delete` | workspace-safe file delete |
-| `LS` | `ls` |
-| `Grep` | `grep` |
-| `Glob` | `find` |
-| `Shell` | `bash` |
-| `WebSearch` | xAI native web search |
-
-The shims also normalize common Cursor argument names, such as `file_path`, `contents`, `old_string` / `new_string`, `query`, `include`, `glob_filter`, and `cmd`. They are disabled again when you switch back to non-Grok-CLI models such as `grok-4.5` or `grok-4.3`.
+This package registers no Cursor/Grok CLI tool shims. Composer, Grok Build, and Grok 4.5 use pi's native tools; install `pi-extensions` separately if you want its shared tool policies.
 
 ---
 
@@ -590,7 +576,6 @@ pi-xai-oauth/
 │       ├── oauth.ts          # OAuth discovery/login/refresh/callback helpers
 │       ├── payload.ts        # xAI Responses payload normalization
 │       ├── responses.ts      # xAI request + streaming helpers
-│       └── tools/            # Custom xAI tools + Cursor/Grok CLI shims
 ├── bin/
 │   └── setup.js              # One-command setup (npx pi-xai-oauth)
 ├── scripts/

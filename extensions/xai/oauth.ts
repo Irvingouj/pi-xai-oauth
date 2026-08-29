@@ -10,6 +10,8 @@ import {
   XAI_OAUTH_REFRESH_SKEW_MS,
   XAI_OAUTH_SCOPE,
 } from "./constants";
+import { loadFleetConfig, onSourceCredentialsUpdated, pullDualAuthFromSource } from "./fleet";
+import { listLocalRefreshTokens, writeDualAuthStores } from "./stores";
 
 type XaiDiscovery = {
   authorization_endpoint: string;
@@ -78,9 +80,16 @@ function callbackCorsOrigin(origin: string | undefined): string | undefined {
   return origin === "https://accounts.x.ai" || origin === "https://auth.x.ai" ? origin : undefined;
 }
 
-/** Refresh xAI OAuth credentials using their refresh token. */
-export async function refreshXaiCredentials(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-  if (!credentials.refresh) {
+/** Refresh against xAI using every unique local refresh token (pi + grok). */
+export async function refreshXaiCredentials(
+  credentials: OAuthCredentials,
+  fallbackRefresh?: string,
+): Promise<OAuthCredentials> {
+  const candidates = listLocalRefreshTokens(credentials.refresh);
+  if (fallbackRefresh && !candidates.includes(fallbackRefresh)) {
+    candidates.push(fallbackRefresh);
+  }
+  if (!candidates.length) {
     throw new Error("xAI credentials are expired and do not include a refresh token");
   }
 
@@ -88,19 +97,54 @@ export async function refreshXaiCredentials(credentials: OAuthCredentials): Prom
     typeof credentials.tokenEndpoint === "string" && credentials.tokenEndpoint
       ? validateXaiEndpoint(credentials.tokenEndpoint)
       : (await xaiDiscovery()).token_endpoint;
-  const data = await exchangeXaiToken(tokenEndpoint, {
-    grant_type: "refresh_token",
-    refresh_token: credentials.refresh,
-    client_id: XAI_OAUTH_CLIENT_ID,
-  });
 
-  return credentialsFromTokenPayload(data, tokenEndpoint, credentials.refresh);
+  let lastError: unknown;
+  for (const refreshToken of candidates) {
+    try {
+      const data = await exchangeXaiToken(tokenEndpoint, {
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: XAI_OAUTH_CLIENT_ID,
+      });
+      return credentialsFromTokenPayload(data, tokenEndpoint, refreshToken);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("xAI token refresh failed for all local refresh tokens");
 }
 
-/** Return credentials as-is when fresh, otherwise refresh them. */
-export async function ensureFreshXaiCredentials(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+/**
+ * Fleet-aware ensure-fresh:
+ * - replica: pull dual auth from Mac first; only local-refresh if source unreachable
+ * - source / no fleet: refresh against xAI, write dual store, push to fleet
+ */
+export async function ensureFreshXaiCredentials(
+  credentials: OAuthCredentials,
+  fallbackRefresh?: string,
+): Promise<OAuthCredentials> {
   if (!credentials.expires || credentials.expires > Date.now()) return credentials;
-  return refreshXaiCredentials(credentials);
+
+  const fleet = loadFleetConfig();
+
+  // Replicas prefer Mac's dual store so they never rotate the shared refresh chain.
+  if (fleet?.role === "replica" && fleet.pullFrom) {
+    const pulled = pullDualAuthFromSource(fleet);
+    if (pulled?.access && (!pulled.expires || pulled.expires > Date.now())) {
+      return pulled;
+    }
+    // Source unreachable or still stale: last-resort local refresh (offline Mac).
+  }
+
+  const fresh = await refreshXaiCredentials(credentials, fallbackRefresh);
+  if (fleet?.role === "source") {
+    onSourceCredentialsUpdated(fresh);
+  } else {
+    writeDualAuthStores(fresh);
+  }
+  return fresh;
 }
 
 async function startCallbackServer(expectedState: string): Promise<{
@@ -381,15 +425,23 @@ export function createXaiOAuth({ getExistingCredentials }: XaiOAuthOptions) {
         code_verifier: verifier,
       });
 
-      return credentialsFromTokenPayload(data, discovery.token_endpoint);
+      const creds = credentialsFromTokenPayload(data, discovery.token_endpoint);
+      // Login always writes dual store; source hosts also push to fleet.
+      const fleet = loadFleetConfig();
+      if (fleet?.role === "source") onSourceCredentialsUpdated(creds);
+      else writeDualAuthStores(creds);
+      return creds;
     },
 
     async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
       if (!credentials.refresh && credentials.expires && credentials.expires <= Date.now()) {
-        throw new Error("xAI OAuth token is expired and cannot be refreshed. Please run /login xai-auth again.");
+        throw new Error(
+          "xAI OAuth token is expired and cannot be refreshed. Source host: /login xai-auth. Replica: ensure Mac fleet push/pull is working.",
+        );
       }
       if (!credentials.refresh) return credentials;
-      return refreshXaiCredentials(credentials);
+      // Fleet-aware path: replica pulls from Mac; source refreshes + dual-writes + pushes.
+      return ensureFreshXaiCredentials(credentials);
     },
 
     getApiKey(credentials: OAuthCredentials): string {

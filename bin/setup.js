@@ -176,16 +176,10 @@ function updateSettings(settingsPath = SETTINGS_PATH) {
     console.log(color("   + Set defaultProvider: xai-auth", "green"));
   }
 
-  if (settings.defaultModel !== "grok-4.5") {
-    settings.defaultModel = "grok-4.5";
+  if (settings.defaultModel !== "grok-4.6") {
+    settings.defaultModel = "grok-4.6";
     changed = true;
-    console.log(color("   + Set defaultModel: grok-4.5", "green"));
-  }
-
-  if (settings.defaultThinkingLevel !== "high") {
-    settings.defaultThinkingLevel = "high";
-    changed = true;
-    console.log(color("   + Set defaultThinkingLevel: high", "green"));
+    console.log(color("   + Set defaultModel: grok-4.6 (SuperGrok / no paid API)", "green"));
   }
 
   if (changed) {
@@ -209,24 +203,15 @@ function printNextSteps(nonInteractive = false) {
     console.log("Next steps:\n");
     console.log(`   ${color("1.", "bold")} Authenticate with xAI OAuth:`);
     console.log(`      ${color("pi /login xai-auth", "cyan")}\n`);
-    console.log(`   ${color("2.", "bold")} Start chatting with Grok 4.5 (already set as default)`);
+    console.log(`   ${color("2.", "bold")} Start chatting with Grok 4.6 (already set as default)`);
     console.log(`      ${color("pi", "cyan")}\n`);
   } else {
-    console.log("Grok 4.5, Grok 4.3, Grok Build, Composer 2.5 + xAI OAuth are now configured and ready.\n");
+    console.log("Grok 4.6 + 4.5 + Build + Composer 2.5 via cli-chat-proxy (no paid api.x.ai) are configured.\n");
   }
 
-  console.log("You now have access to powerful reasoning, coding models, and long context!\n");
-  console.log("Bonus tools available:");
-  console.log("   • xai_generate_text     — Generate text with full reasoning");
-  console.log("   • xai_multi_agent       — Multi-agent research with web/X tools");
-  console.log("   • xai_web_search        — Native xAI web search");
-  console.log("   • xai_x_search          — Native X/Twitter search");
-  console.log("   • xai_code_execution    — Native code interpreter");
-  console.log("   • xai_generate_image    — Image generation");
-  console.log("   • xai_analyze_image     — Image analysis");
-  console.log("   • xai_critique          — Structured critique");
-  console.log("   • xai_deep_research     — Deep research with web/X tools\n");
-  console.log(`   Update later: ${color("pi update npm:pi-xai-oauth", "yellow")}\n`);
+  console.log("Models: grok-4.6 (default), grok-4.5, grok-build, grok-composer-2.5-fast");
+  console.log("Tools: pi native tools (no Cursor shims, no xai_* API tools)\n");
+  console.log(`   Update later: ${color("pi update /path/to/pi-xai-oauth", "yellow")}\n`);
 }
 
 function printScaffoldHeader() {

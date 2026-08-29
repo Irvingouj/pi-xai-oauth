@@ -1,7 +1,88 @@
 import type { Api, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { normalizeXaiImageInput } from "./images";
-import { grokSupportsReasoningEffort, isGrokCliProxyModel } from "./models";
+import { DEFAULT_XAI_MODEL } from "./constants";
+import {
+  grokSupportsReasoningEffort,
+  isCliProxyRoutedModel,
+  isGrokCliProxyModel,
+  xaiCatalogModel,
+} from "./models";
 import { textFromResponsesContent } from "./text";
+
+const THINKING_LADDER = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+const ENCRYPTED_REASONING_INCLUDE = "reasoning.encrypted_content";
+
+function thinkingMapFor(modelId: string): Record<string, string | null> | undefined {
+  const map = xaiCatalogModel(modelId)?.thinkingLevelMap as Record<string, string | null> | undefined;
+  return map && typeof map === "object" ? map : undefined;
+}
+
+/** Map a pi thinking level onto a wire effort Grok actually advertises. */
+export function mapGrokReasoningEffort(modelId: string, effort: string): string | undefined {
+  if (!effort || effort === "none" || effort === "off") return undefined;
+  const map = thinkingMapFor(modelId);
+  if (map && Object.prototype.hasOwnProperty.call(map, effort)) {
+    const mapped = map[effort];
+    if (typeof mapped === "string" && mapped) return mapped;
+    if (mapped === null) return nearestSupportedEffort(map, effort);
+  }
+  if (effort === "minimal") return "low";
+  if (effort === "max") {
+    if (typeof map?.xhigh === "string") return map.xhigh;
+    if (typeof map?.high === "string") return map.high;
+    return "high";
+  }
+  return effort;
+}
+
+function nearestSupportedEffort(map: Record<string, string | null>, effort: string): string | undefined {
+  const start = THINKING_LADDER.indexOf(effort as (typeof THINKING_LADDER)[number]);
+  if (start === -1) return undefined;
+  for (let i = start - 1; i >= 0; i--) {
+    const candidate = THINKING_LADDER[i];
+    const mapped = map[candidate];
+    if (typeof mapped === "string" && mapped) return mapped;
+  }
+  for (let i = start + 1; i < THINKING_LADDER.length; i++) {
+    const candidate = THINKING_LADDER[i];
+    const mapped = map[candidate];
+    if (typeof mapped === "string" && mapped) return mapped;
+  }
+  return undefined;
+}
+
+/**
+ * Grok CLI (`apply_response_defaults`) always asks for encrypted reasoning on
+ * Responses, then replays typed `reasoning` items with `encrypted_content`
+ * verbatim. `status` is output-only and 400s on input; content parts need an
+ * explicit `reasoning_text` type.
+ */
+function normalizeReasoningInputItem(item: Record<string, any>): Record<string, any> {
+  const next: Record<string, any> = { ...item, type: "reasoning" };
+  delete next.status;
+  if (Array.isArray(next.content)) {
+    next.content = next.content.map((part: unknown) => {
+      if (!part || typeof part !== "object") return part;
+      const obj = part as Record<string, any>;
+      if (typeof obj.text === "string" && (typeof obj.type !== "string" || !obj.type)) {
+        return { ...obj, type: "reasoning_text" };
+      }
+      return obj;
+    });
+  }
+  return next;
+}
+
+function ensureEncryptedReasoningInclude(body: Record<string, any>, enabled: boolean): void {
+  const include = Array.isArray(body.include) ? body.include.filter((item: unknown) => typeof item === "string") : [];
+  const without = include.filter((item: string) => item !== ENCRYPTED_REASONING_INCLUDE);
+  if (enabled) {
+    body.include = [ENCRYPTED_REASONING_INCLUDE, ...without];
+    return;
+  }
+  if (without.length > 0) body.include = without;
+  else delete body.include;
+}
 
 function normalizeResponsesImageParts(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(normalizeResponsesImageParts);
@@ -94,7 +175,13 @@ function normalizeXaiResponsesInput(input: unknown[], model: Model<Api>): unknow
 export function rewriteXaiResponsesPayload(payload: unknown, model: Model<Api>, options?: SimpleStreamOptions): unknown {
   if (!payload || typeof payload !== "object") return payload;
   const body: Record<string, any> = { ...(payload as Record<string, any>) };
-  const modelId = String(body.model || model.id);
+  // This fork is cli-chat-proxy only: coerce any non-CLI model id onto the
+  // provider default (grok-4.6) so we never open paid api.x.ai.
+  let modelId = String(body.model || model.id);
+  if (!isCliProxyRoutedModel(modelId)) {
+    modelId = isCliProxyRoutedModel(model.id) ? model.id : DEFAULT_XAI_MODEL;
+    body.model = modelId;
+  }
   const usesGrokCliProxy = isGrokCliProxyModel(modelId);
 
   // xAI's Responses API matches the OpenAI surface but has a few stricter
@@ -106,14 +193,18 @@ export function rewriteXaiResponsesPayload(payload: unknown, model: Model<Api>, 
     const instructionParts: string[] = [];
 
     if (usesGrokCliProxy) {
-      input = input.filter((item) => {
-        if (!item || typeof item !== "object") return true;
-        if (item.type === "reasoning") return false;
-        if (typeof item.content === "string" && item.content.length === 0) return false;
-        if (item.role !== "developer" && item.role !== "system") return true;
+      input = input.flatMap((item) => {
+        if (!item || typeof item !== "object") return [item];
+        if (item.type === "reasoning") {
+          // Composer is a non-reasoner; never replay encrypted blobs into it.
+          if (xaiCatalogModel(modelId)?.reasoning === false) return [];
+          return [normalizeReasoningInputItem(item)];
+        }
+        if (typeof item.content === "string" && item.content.length === 0) return [];
+        if (item.role !== "developer" && item.role !== "system") return [item];
         const text = textFromResponsesContent(item.content).trim();
         if (text) instructionParts.push(text);
-        return false;
+        return [];
       });
     } else {
       while (input.length > 0) {
@@ -140,17 +231,24 @@ export function rewriteXaiResponsesPayload(payload: unknown, model: Model<Api>, 
 
   if (body.reasoning && typeof body.reasoning === "object") {
     const effort = body.reasoning.effort;
-    if (typeof effort === "string" && effort !== "none" && grokSupportsReasoningEffort(modelId)) {
-      body.reasoning = { effort: effort === "minimal" ? "low" : effort };
+    const mapped = typeof effort === "string" ? mapGrokReasoningEffort(modelId, effort) : undefined;
+    if (mapped && grokSupportsReasoningEffort(modelId)) {
+      // Grok CLI sends `{ effort, summary: "concise" }`. Keep summary if present;
+      // otherwise omit it rather than inventing OpenAI's "auto".
+      const next: Record<string, string> = { effort: mapped };
+      if (typeof body.reasoning.summary === "string" && body.reasoning.summary) {
+        next.summary = body.reasoning.summary === "auto" ? "concise" : body.reasoning.summary;
+      }
+      body.reasoning = next;
     } else {
       delete body.reasoning;
     }
   }
 
-  if (usesGrokCliProxy && Array.isArray(body.include)) {
-    body.include = body.include.filter((item: unknown) => item !== "reasoning.encrypted_content");
-    if (body.include.length === 0) delete body.include;
-  }
+  // Match Grok CLI `apply_response_defaults` for reasoners: request encrypted
+  // reasoning so the next turn can replay exact tokens. Skip non-reasoners
+  // (Composer).
+  ensureEncryptedReasoningInclude(body, usesGrokCliProxy && xaiCatalogModel(modelId)?.reasoning !== false);
 
   // xAI doesn't implement OpenAI's prompt_cache_retention knobs. Keep the
   // cache key (Responses API body field), but remove retention.

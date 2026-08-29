@@ -12,11 +12,9 @@ export function sanitizeXaiPayload(payload: unknown, model: Model<any>): unknown
 
   const body = { ...(payload as Record<string, any>) };
 
-  // 1. Remove unsupported reasoning fields
-  if (Array.isArray(body.include)) {
-    body.include = body.include.filter((item: string) => item !== "reasoning.encrypted_content");
-    if (body.include.length === 0) delete body.include;
-  }
+  // 1. Grok CLI always requests encrypted reasoning on Responses and replays
+  //    typed reasoning items. Do not strip `reasoning.encrypted_content`.
+  //    (Live rewrite lives in extensions/xai/payload.ts.)
 
   // 2. Remove prompt_cache_retention (not supported by xAI)
   delete body.prompt_cache_retention;

@@ -1,14 +1,45 @@
 import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
-// IMPORTANT: import transport helpers from the package root, not
-// "@earendil-works/pi-ai/api/...". Pi's extension loader (jiti) aliases
-// "@earendil-works/pi-ai" → dist/compat.js; subpath imports become
-// "compat.js/api/..." and fail at runtime.
-import { streamSimpleOpenAIResponses } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
-import { isGrokCliProxyModel, xaiBaseUrlForModel, xaiModelForRequest, xaiModelRequestHeaders, xaiResponsesUrlForModel } from "./models";
+import { isCliProxyRoutedModel, xaiBaseUrlForModel, xaiModelRequestHeaders } from "./models";
+import { DEFAULT_XAI_MODEL } from "./constants";
 import { rewriteXaiResponsesPayload } from "./payload";
+import { isRetryableXaiStreamError, resolveXaiRetryPolicy, retryDelayMs, sleepAbortable } from "./retry";
 
 type AssistantStreamEvent = Record<string, any>;
+
+type OpenAIResponsesStreamSimple = (
+  model: Model<"openai-responses">,
+  context: Context,
+  options?: SimpleStreamOptions,
+) => AsyncIterable<AssistantStreamEvent> & { result?: () => Promise<any> };
+
+/**
+ * Resolve pi's OpenAI Responses streamSimple across loader environments:
+ * - Pi jiti aliases `@earendil-works/pi-ai` → compat (exports streamSimpleOpenAIResponses)
+ * - Plain Node resolves package root index (no legacy aliases) or the /api/* subpath
+ */
+async function loadStreamSimpleOpenAIResponses(): Promise<OpenAIResponsesStreamSimple> {
+  const tryModule = async (specifier: string, exportName: string) => {
+    try {
+      const mod: any = await import(specifier);
+      const fn = mod?.[exportName];
+      return typeof fn === "function" ? (fn as OpenAIResponsesStreamSimple) : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  return (
+    (await tryModule("@earendil-works/pi-ai", "streamSimpleOpenAIResponses")) ||
+    (await tryModule("@earendil-works/pi-ai/compat", "streamSimpleOpenAIResponses")) ||
+    (await tryModule("@earendil-works/pi-ai/api/openai-responses", "streamSimple")) ||
+    (() => {
+      throw new Error(
+        "Unable to load OpenAI Responses streamSimple from @earendil-works/pi-ai (root/compat/api)",
+      );
+    })()
+  );
+}
 
 function resultFromStreamEvent(event: AssistantStreamEvent): any {
   if (event.type === "done") return event.message;
@@ -69,6 +100,13 @@ function createForwardingAssistantStream() {
   };
 }
 
+function streamErrorText(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const cause = (error as Error & { cause?: unknown }).cause;
+  const causeText = cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "";
+  return causeText && !error.message.includes(causeText) ? `${error.message}: ${causeText}` : error.message;
+}
+
 function streamErrorMessage(model: Model<Api>, error: unknown) {
   return {
     role: "assistant",
@@ -85,55 +123,23 @@ function streamErrorMessage(model: Model<Api>, error: unknown) {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     },
     stopReason: "error",
-    errorMessage: error instanceof Error ? error.message : String(error),
+    errorMessage: streamErrorText(error),
     timestamp: Date.now(),
   };
 }
 
-/** POST a JSON body to an xAI endpoint with OAuth bearer auth. */
-export async function postXaiJson(
-  apiKey: string,
-  url: string,
-  body: Record<string, any>,
-  signal?: AbortSignal,
-  headers: Record<string, string> = {},
-): Promise<any> {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-      ...headers,
-    },
-    body: JSON.stringify(body),
-    signal,
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "Unknown error");
-    const error = new Error(errorText);
-    (error as any).status = response.status;
-    throw error;
+function eventErrorText(event: AssistantStreamEvent): string {
+  const err = event?.error;
+  if (typeof err === "string") return err;
+  if (err && typeof err === "object") {
+    if (typeof err.errorMessage === "string") return err.errorMessage;
+    if (typeof err.message === "string") return err.message;
   }
-
-  return response.json();
+  return "";
 }
 
-/** Create a single xAI Responses API response with model-aware routing. */
-export async function createXaiResponse(apiKey: string, body: Record<string, any>, signal?: AbortSignal): Promise<any> {
-  const model = xaiModelForRequest(typeof body.model === "string" ? body.model : undefined);
-  const payload = rewriteXaiResponsesPayload(body, model) as Record<string, any>;
-  const usesGrokCliProxy = isGrokCliProxyModel(model.id);
-  const grokCliSessionId = usesGrokCliProxy
-    ? (typeof body.previous_response_id === "string" && body.previous_response_id) || randomUUID()
-    : undefined;
-  return postXaiJson(
-    apiKey,
-    xaiResponsesUrlForModel(model.id),
-    payload,
-    signal,
-    xaiModelRequestHeaders(model.id, grokCliSessionId),
-  );
+function isAborted(signal?: AbortSignal): boolean {
+  return Boolean(signal?.aborted);
 }
 
 /**
@@ -159,9 +165,12 @@ export function streamSimpleXaiResponses(model: Model<Api>, context: Context, op
   // proxy also benefit from the x-grok-conv-id header.
   // https://docs.x.ai/developers/advanced-api-usage/prompt-caching/maximizing-cache-hits
   const sessionId = options?.sessionId;
-  const routingSessionId = sessionId || (isGrokCliProxyModel(model.id) ? randomUUID() : undefined);
+  // Grok Build-only: always stamp a conversation id for the CLI proxy.
+  const routingSessionId = sessionId || randomUUID();
   const streamModel = {
     ...model,
+    // Coerce any stale/API model id onto a CLI-proxy model for headers/URL.
+    id: isCliProxyRoutedModel(model.id) ? model.id : DEFAULT_XAI_MODEL,
     baseUrl: xaiBaseUrlForModel(model.id),
     headers: {
       ...(model as any).headers,
@@ -176,27 +185,91 @@ export function streamSimpleXaiResponses(model: Model<Api>, context: Context, op
   };
   const headers = { ...(options?.headers || {}) };
   if (routingSessionId && !headers["x-grok-conv-id"]) headers["x-grok-conv-id"] = routingSessionId;
+  if (routingSessionId && !headers["x-grok-session-id"]) headers["x-grok-session-id"] = routingSessionId;
 
   const stream = createForwardingAssistantStream();
   void (async () => {
     try {
-      const inner = streamSimpleOpenAIResponses(openAIResponsesModel as Model<"openai-responses">, context, {
-        ...options,
-        // Ensure rewriteXaiResponsesPayload can always stamp prompt_cache_key.
-        sessionId: sessionId || routingSessionId,
-        headers,
-        async onPayload(payload) {
-          const rewritten = rewriteXaiResponsesPayload(payload, streamModel, {
-            ...options,
-            sessionId: sessionId || routingSessionId,
-          });
-          const userRewritten = await options?.onPayload?.(rewritten, streamModel);
-          return userRewritten === undefined ? rewritten : userRewritten;
-        },
-      });
-      for await (const event of inner as AsyncIterable<AssistantStreamEvent>) {
-        stream.push(event);
+      const streamSimpleOpenAIResponses = await loadStreamSimpleOpenAIResponses();
+      const { maxAttempts, baseDelayMs } = resolveXaiRetryPolicy();
+      let lastRetryableError: AssistantStreamEvent | undefined;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        if (isAborted(options?.signal)) {
+          const message = streamErrorMessage(model, Object.assign(new Error("Request was aborted"), { name: "AbortError" }));
+          message.stopReason = "aborted";
+          stream.push({ type: "error", reason: "aborted", error: message });
+          stream.end(message);
+          return;
+        }
+
+        const inner = streamSimpleOpenAIResponses(openAIResponsesModel as Model<"openai-responses">, context, {
+          ...options,
+          // OpenAI SDK connection retries (before SSE starts). Default in pi-ai is 0.
+          maxRetries: options?.maxRetries ?? 2,
+          sessionId: sessionId || routingSessionId,
+          headers,
+          async onPayload(payload) {
+            const rewritten = rewriteXaiResponsesPayload(payload, streamModel, {
+              ...options,
+              sessionId: sessionId || routingSessionId,
+            });
+            const userRewritten = await options?.onPayload?.(rewritten, streamModel);
+            return userRewritten === undefined ? rewritten : userRewritten;
+          },
+        });
+
+        const buffered: AssistantStreamEvent[] = [];
+        let retryableError: AssistantStreamEvent | undefined;
+        try {
+          for await (const event of inner as AsyncIterable<AssistantStreamEvent>) {
+            if (isAborted(options?.signal)) {
+              const message = streamErrorMessage(model, Object.assign(new Error("Request was aborted"), { name: "AbortError" }));
+              message.stopReason = "aborted";
+              stream.push({ type: "error", reason: "aborted", error: message });
+              stream.end(message);
+              return;
+            }
+            if (
+              event.type === "error" &&
+              attempt < maxAttempts &&
+              isRetryableXaiStreamError(eventErrorText(event))
+            ) {
+              retryableError = event;
+              break;
+            }
+            buffered.push(event);
+            if (event.type === "done" || event.type === "error") break;
+          }
+        } catch (error) {
+          const text = streamErrorText(error);
+          if (attempt < maxAttempts && isRetryableXaiStreamError(text) && !isAborted(options?.signal)) {
+            retryableError = { type: "error", reason: "error", error: streamErrorMessage(model, error) };
+          } else {
+            const message = streamErrorMessage(model, error);
+            stream.push({ type: "error", reason: message.stopReason, error: message });
+            stream.end(message);
+            return;
+          }
+        }
+
+        if (!retryableError) {
+          for (const event of buffered) stream.push(event);
+          stream.end();
+          return;
+        }
+
+        lastRetryableError = retryableError;
+        try {
+          await sleepAbortable(retryDelayMs(attempt, baseDelayMs), options?.signal);
+        } catch {
+          const message = streamErrorMessage(model, Object.assign(new Error("Request was aborted"), { name: "AbortError" }));
+          message.stopReason = "aborted";
+          stream.push({ type: "error", reason: "aborted", error: message });
+          stream.end(message);
+          return;
+        }
       }
+      if (lastRetryableError) stream.push(lastRetryableError);
       stream.end();
     } catch (error) {
       const message = streamErrorMessage(model, error);

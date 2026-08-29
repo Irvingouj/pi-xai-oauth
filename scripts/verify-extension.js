@@ -2,7 +2,6 @@
 
 const assert = require("assert");
 const path = require("path");
-const fs = require("fs/promises");
 const { createJiti } = require("jiti");
 
 const repoRoot = path.resolve(__dirname, "..");
@@ -74,40 +73,15 @@ function urlOriginIs(url, expectedOrigin) {
 function loadExtension() {
   const providers = new Map();
   const tools = new Map();
-  const handlers = new Map();
-  let activeTools = ["read", "bash", "edit", "write"];
-  let throwOnGetActiveTools = false;
-  let throwOnSetActiveTools = false;
   extension({
-    on(event, handler) {
-      handlers.set(event, handler);
-    },
     registerProvider(name, config) {
       providers.set(name, config);
     },
     registerTool(tool) {
       tools.set(tool.name, tool);
     },
-    getActiveTools() {
-      if (throwOnGetActiveTools) throw new Error("tool registry not ready");
-      return activeTools;
-    },
-    setActiveTools(toolNames) {
-      if (throwOnSetActiveTools) throw new Error("tool registry temporarily unavailable");
-      activeTools = toolNames;
-    },
   });
-  return {
-    providers,
-    tools,
-    handlers,
-    getActiveTools: () => activeTools,
-    setActiveTools: (toolNames) => { activeTools = toolNames; },
-    setToolRegistryFailures({ get = false, set = false } = {}) {
-      throwOnGetActiveTools = get;
-      throwOnSetActiveTools = set;
-    },
-  };
+  return { providers, tools };
 }
 
 function authContext() {
@@ -137,20 +111,6 @@ async function runTool(tools, name, params = {}, expectedText = "OK", requestOri
   assert.equal(headerValue(request.headers, "Authorization"), "Bearer oauth-token", `${name} should use OAuth token from pi model registry`);
   assert.strictEqual(request.signal, controller.signal, `${name} should pass the pi cancellation signal`);
   return { body: request.body, request, result };
-}
-
-async function verifyCursorToolShims(tools) {
-  // Local fork: no Cursor/Grok CLI shims — pi native tools only.
-  for (const name of ["Read", "Write", "StrReplace", "Edit", "Delete", "LS", "Grep", "Glob", "Shell", "WebSearch"]) {
-    assert.ok(!tools.has(name), `${name} Cursor/Grok CLI shim must NOT be registered (pi-native fork)`);
-  }
-}
-
-async function verifyCursorToolActivation(loadResult) {
-  // Shims are not registered; activation sync was removed. No-op keep test hook.
-  const tools = loadResult.tools;
-  await verifyCursorToolShims(tools);
-  assert.ok(!loadResult.handlers.has("model_select") || true, "shim activation handlers optional");
 }
 
 function lastResultErrorMessage(result) {
@@ -193,10 +153,10 @@ async function verifyXaiResponsesTransport(provider) {
   const message = await captureStreamResultMessage(() =>
     provider.streamSimple(
       {
-        id: "grok-4.3",
+        id: "grok-build",
         provider: "xai-auth",
         api: "xai-responses",
-        baseUrl: "https://api.x.ai/v1",
+        baseUrl: "https://cli-chat-proxy.grok.com/v1",
         headers: {},
         reasoning: true,
         input: ["text", "image"],
@@ -207,22 +167,164 @@ async function verifyXaiResponsesTransport(provider) {
   );
   assert.ok(typeof message === "string", "xAI provider stream should expose a terminal result message");
   assert.ok(
-    requests.slice(before).some((entry) => entry.url && urlOriginIs(entry.url, "https://api.x.ai")),
-    "xAI stream should reach the xAI endpoint through the OpenAI Responses transport",
+    requests.slice(before).some((entry) => entry.url && urlOriginIs(entry.url, "https://cli-chat-proxy.grok.com")),
+    "Grok Build stream should reach the Grok CLI proxy endpoint",
   );
 }
 
 
-async function verifyCliModelStreamRouting(provider) {
-  // Local fork: Composer / Grok Build (CLI-proxy models) are not registered.
-  const composer = provider.models.find((model) => model.id === "grok-composer-2.5-fast");
-  const build = provider.models.find((model) => model.id === "grok-build");
-  assert.equal(composer, undefined, "Composer 2.5 must not be listed in this pi-native fork");
-  assert.equal(build, undefined, "Grok Build must not be listed in this pi-native fork");
-  assert.ok(
-    provider.models.some((model) => model.id === "grok-4.5"),
-    "Grok 4.5 must remain available",
+function verifyXaiRetryClassification() {
+  const { isRetryableXaiStreamError, resolveXaiRetryPolicy, retryDelayMs } = jiti(
+    path.join(repoRoot, "extensions", "xai", "retry.ts"),
   );
+  assert.equal(isRetryableXaiStreamError("Connection error."), true);
+  assert.equal(isRetryableXaiStreamError("fetch failed"), true);
+  assert.equal(isRetryableXaiStreamError("Error Code null: The model is currently at capacity due to high demand."), true);
+  assert.equal(isRetryableXaiStreamError("503 Service Unavailable"), true);
+  assert.equal(isRetryableXaiStreamError("Request was aborted"), false);
+  assert.equal(isRetryableXaiStreamError("insufficient_quota"), false);
+  assert.equal(isRetryableXaiStreamError("401 Unauthorized"), false);
+  assert.equal(
+    isRetryableXaiStreamError("Could not decrypt the provided encrypted_content"),
+    false,
+    "encrypted_content mismatch is a new-session error, never a retry",
+  );
+  const prevAttempts = process.env.PI_XAI_RETRY_ATTEMPTS;
+  const prevBase = process.env.PI_XAI_RETRY_BASE_MS;
+  process.env.PI_XAI_RETRY_ATTEMPTS = "5";
+  process.env.PI_XAI_RETRY_BASE_MS = "1000";
+  assert.deepEqual(resolveXaiRetryPolicy(), { maxAttempts: 5, baseDelayMs: 1000 });
+  assert.ok(retryDelayMs(1, 1000) >= 1000);
+  assert.ok(retryDelayMs(3, 1000) >= 4000);
+  if (prevAttempts === undefined) delete process.env.PI_XAI_RETRY_ATTEMPTS;
+  else process.env.PI_XAI_RETRY_ATTEMPTS = prevAttempts;
+  if (prevBase === undefined) delete process.env.PI_XAI_RETRY_BASE_MS;
+  else process.env.PI_XAI_RETRY_BASE_MS = prevBase;
+}
+
+function verifyGrok46CliProxyPayloadRewrite() {
+  const { rewriteXaiResponsesPayload, mapGrokReasoningEffort } = jiti(
+    path.join(repoRoot, "extensions", "xai", "payload.ts"),
+  );
+  const rewritten = rewriteXaiResponsesPayload(
+    {
+      model: "grok-4.6",
+      include: ["file_search_call.results"],
+      reasoning: { effort: "xhigh", summary: "auto" },
+      input: [
+        { role: "user", content: [{ type: "input_text", text: "hello" }] },
+        {
+          type: "reasoning",
+          id: "rs_test",
+          encrypted_content: "enc_blob",
+          status: "completed",
+          content: [{ text: "hidden chain" }],
+        },
+        { role: "assistant", content: [{ type: "output_text", text: "hi" }] },
+      ],
+    },
+    { id: "grok-4.6", provider: "xai-auth", input: ["text", "image"] },
+  );
+  assert.equal(rewritten.reasoning?.effort, "xhigh", "Grok 4.6 should keep xhigh reasoning effort");
+  assert.equal(rewritten.reasoning?.summary, "concise", "OpenAI summary=auto maps to Grok CLI concise");
+  assert.deepEqual(
+    rewritten.include,
+    ["reasoning.encrypted_content", "file_search_call.results"],
+    "Grok 4.6 must request reasoning.encrypted_content like Grok CLI apply_response_defaults",
+  );
+  const reasoning = (rewritten.input || []).find((item) => item && item.type === "reasoning");
+  assert.ok(reasoning, "Grok 4.6 must replay typed reasoning items");
+  assert.equal(reasoning.encrypted_content, "enc_blob", "encrypted_content must round-trip verbatim");
+  assert.equal(reasoning.status, undefined, "status is output-only and must be stripped on input");
+  assert.equal(reasoning.content[0].type, "reasoning_text", "reasoning content parts need an explicit type");
+
+  const rewritten45 = rewriteXaiResponsesPayload(
+    { model: "grok-4.5", reasoning: { effort: "xhigh" } },
+    { id: "grok-4.5", provider: "xai-auth", input: ["text", "image"] },
+  );
+  assert.equal(rewritten45.reasoning?.effort, "high", "Grok 4.5 must clamp unsupported xhigh to high");
+  assert.equal(mapGrokReasoningEffort("grok-4.5", "xhigh"), "high");
+  assert.equal(mapGrokReasoningEffort("grok-4.6", "max"), "xhigh");
+
+  const rewrittenComposer = rewriteXaiResponsesPayload(
+    {
+      model: "grok-composer-2.5-fast",
+      include: ["reasoning.encrypted_content"],
+      reasoning: { effort: "high" },
+      input: [{ type: "reasoning", id: "rs_x", encrypted_content: "enc" }],
+    },
+    { id: "grok-composer-2.5-fast", provider: "xai-auth", input: ["text", "image"] },
+  );
+  assert.equal(rewrittenComposer.reasoning, undefined, "Composer must not send reasoning effort");
+  assert.ok(
+    !(rewrittenComposer.include || []).includes("reasoning.encrypted_content"),
+    "Composer must not request encrypted reasoning",
+  );
+  assert.ok(
+    !(rewrittenComposer.input || []).some((item) => item && item.type === "reasoning"),
+    "Composer must not replay reasoning items",
+  );
+}
+
+async function verifyCliModelStreamRouting(provider) {
+  const composer = provider.models.find((model) => model.id === "grok-composer-2.5-fast");
+  const model = {
+    ...composer,
+    provider: "xai-auth",
+    api: provider.api,
+    baseUrl: provider.baseUrl,
+  };
+  const before = requests.length;
+  const stream = provider.streamSimple(
+    model,
+    { messages: [{ role: "user", content: "hello", timestamp: Date.now() }] },
+    { apiKey: "oauth-token", sessionId: "session-test" },
+  );
+  await stream.result();
+  const request = requests.slice(before).find((entry) => entry.url && urlOriginIs(entry.url, "https://cli-chat-proxy.grok.com"));
+  assert.ok(request, "Composer 2.5 provider streams should route to the Grok CLI endpoint");
+  assert.equal(request.body.model, "grok-composer-2.5-fast");
+  assert.equal(request.body.reasoning, undefined, "Composer 2.5 provider streams should not send reasoning effort");
+  assert.ok(
+    !(request.body.include || []).includes("reasoning.encrypted_content"),
+    "Composer 2.5 is a non-reasoner and must not request encrypted reasoning",
+  );
+  assert.equal(headerValue(request.headers, "Authorization"), "Bearer oauth-token");
+  assert.equal(headerValue(request.headers, "x-xai-token-auth"), "xai-grok-cli");
+  assert.equal(headerValue(request.headers, "x-grok-model-override"), "grok-composer-2.5-fast");
+  assert.equal(headerValue(request.headers, "x-grok-conv-id"), "session-test");
+
+  const grok46 = provider.models.find((model) => model.id === "grok-4.6");
+  const before46 = requests.length;
+  const stream46 = provider.streamSimple(
+    { ...grok46, provider: "xai-auth", api: provider.api, baseUrl: provider.baseUrl },
+    { messages: [{ role: "user", content: "hello", timestamp: Date.now() }] },
+    { apiKey: "oauth-token", sessionId: "session-46" },
+  );
+  await stream46.result();
+  const request46 = requests.slice(before46).find((entry) => entry.url && urlOriginIs(entry.url, "https://cli-chat-proxy.grok.com"));
+  assert.ok(request46, "Grok 4.6 should stream via cli-chat-proxy");
+  assert.equal(request46.body.model, "grok-4.6");
+  assert.equal(headerValue(request46.headers, "x-grok-model-override"), "grok-4.6");
+  assert.equal(headerValue(request46.headers, "x-grok-client-version"), "1.0.5");
+  assert.equal(headerValue(request46.headers, "x-grok-session-id"), "session-46");
+  assert.ok(
+    (request46.body.include || []).includes("reasoning.encrypted_content"),
+    "Grok 4.6 live streams must request encrypted reasoning like Grok CLI",
+  );
+
+  const grok45 = provider.models.find((model) => model.id === "grok-4.5");
+  const before45 = requests.length;
+  const stream45 = provider.streamSimple(
+    { ...grok45, provider: "xai-auth", api: provider.api, baseUrl: provider.baseUrl },
+    { messages: [{ role: "user", content: "hello", timestamp: Date.now() }] },
+    { apiKey: "oauth-token", sessionId: "session-45" },
+  );
+  await stream45.result();
+  const request45 = requests.slice(before45).find((entry) => entry.url && urlOriginIs(entry.url, "https://cli-chat-proxy.grok.com"));
+  assert.ok(request45, "Grok 4.5 should stream via cli-chat-proxy");
+  assert.equal(request45.body.model, "grok-4.5");
+  assert.equal(headerValue(request45.headers, "x-grok-model-override"), "grok-4.5");
 }
 
 async function verifyOAuthCallbackState(provider) {
@@ -341,124 +443,62 @@ async function verifyOAuthManualWrongStateIgnored(provider) {
 async function main() {
   process.env.HOME = path.join(repoRoot, ".tmp-empty-home-for-tests");
   process.env.XAI_API_KEY = "must-not-be-used";
+  // Keep mocked stream tests on a single attempt so backoff cannot stall CI.
+  process.env.PI_XAI_RETRY_ATTEMPTS = process.env.PI_XAI_RETRY_ATTEMPTS || "1";
+  process.env.PI_XAI_RETRY_BASE_MS = process.env.PI_XAI_RETRY_BASE_MS || "0";
   installFetchMock();
 
   try {
-    const firstLoad = loadExtension();
-    const { providers, tools } = firstLoad;
+    const { providers, tools } = loadExtension();
     const secondLoad = loadExtension();
     const provider = providers.get("xai-auth");
     assert.ok(provider, "xai-auth provider should be registered");
     assert.equal(secondLoad.tools.size, tools.size, "extension reloads should register tools on the new pi API object");
     assert.equal(provider.api, "xai-responses");
+    assert.equal(provider.baseUrl, "https://cli-chat-proxy.grok.com/v1", "provider base must be Grok CLI proxy");
+    assert.equal(provider.models.length, 4, "CLI proxy catalog: grok-4.6, grok-4.5, grok-build, grok-composer-2.5-fast");
+    const grok46 = provider.models.find((model) => model.id === "grok-4.6");
+    assert.ok(grok46, "grok-4.6 should be registered via cli-chat-proxy");
+    assert.equal(grok46?.contextWindow, 500_000);
+    assert.equal(grok46?.thinkingLevelMap?.off, null);
+    assert.equal(grok46?.thinkingLevelMap?.xhigh, "xhigh");
     const grok45 = provider.models.find((model) => model.id === "grok-4.5");
-    assert.ok(grok45, "grok-4.5 should be registered in the xAI model catalog");
+    assert.ok(grok45, "grok-4.5 should remain registered via cli-chat-proxy");
     assert.equal(grok45?.contextWindow, 500_000);
-    assert.equal(grok45?.reasoning, true);
-    assert.equal(grok45?.cost.input, 2);
-    assert.equal(grok45?.cost.cacheRead, 0.5);
-    assert.equal(grok45?.cost.output, 6);
-    assert.equal(grok45?.thinkingLevelMap?.off, null, "Grok 4.5 reasoning cannot be disabled");
-    assert.equal(provider.models.find((model) => model.id === "grok-4.3")?.contextWindow, 1_000_000);
-    // Local fork: no CLI-proxy models (Composer / Grok Build).
-    assert.equal(provider.models.find((model) => model.id === "grok-build"), undefined);
-    assert.equal(provider.models.find((model) => model.id === "grok-composer-2.5-fast"), undefined);
-    assert.equal(provider.models.find((model) => model.id === "grok-4.20-0309-reasoning")?.contextWindow, 2_000_000);
-    assert.ok(provider.models.some((model) => model.id === "grok-4.20-multi-agent-0309"));
+    assert.equal(grok45?.thinkingLevelMap?.off, null);
+    assert.equal(grok45?.thinkingLevelMap?.xhigh, null);
+    assert.equal(provider.models.find((model) => model.id === "grok-build")?.contextWindow, 512_000);
+    assert.equal(provider.models.find((model) => model.id === "grok-composer-2.5-fast")?.contextWindow, 200_000);
+    assert.equal(provider.models.find((model) => model.id === "grok-composer-2.5-fast")?.reasoning, false);
+    for (const id of ["grok-4.3", "grok-4.20-0309-reasoning", "grok-4.20-multi-agent-0309"]) {
+      assert.equal(provider.models.find((model) => model.id === id), undefined, `${id} must not be registered`);
+    }
+    // Paid API custom tools must not be registered.
+    for (const name of [
+      "xai_generate_text",
+      "xai_web_search",
+      "xai_x_search",
+      "xai_code_execution",
+      "xai_multi_agent",
+      "xai_generate_image",
+      "xai_deep_research",
+      "xai_critique",
+      "xai_analyze_image",
+    ]) {
+      assert.ok(!tools.has(name), `${name} must not be registered (API billing)`);
+    }
 
     await verifyOpenAIResponsesTransport();
     await verifyXaiResponsesTransport(provider);
 
     await verifyCliModelStreamRouting(provider);
-    await verifyCursorToolActivation(firstLoad);
-    await verifyCursorToolShims(tools);
+    verifyGrok46CliProxyPayloadRewrite();
+    verifyXaiRetryClassification();
 
     await verifyOAuthCallbackState(provider);
     await verifyOAuthManualRawCode(provider);
     await verifyOAuthManualCallbackUrlState(provider);
     await verifyOAuthManualWrongStateIgnored(provider);
-
-    const noAuthResult = await tools.get("xai_generate_text").execute("call_noauth", { prompt: "hi" }, undefined, () => {}, {
-      modelRegistry: {
-        find: () => undefined,
-      },
-    });
-    assert.match(noAuthResult.content[0].text, /No xAI OAuth credentials/, "tools should not fall back to XAI_API_KEY");
-
-    const { body: grok45TextBody } = await runTool(tools, "xai_generate_text", {
-      prompt: "hi",
-      model: "grok-4.5",
-    });
-    assert.equal(grok45TextBody.model, "grok-4.5", "xai_generate_text should support explicit Grok 4.5 requests");
-    assert.equal(grok45TextBody.reasoning.effort, "high", "Grok 4.5 text generation should default to high reasoning");
-
-    // Composer / Grok Build CLI-proxy tool routes removed in this local fork.
-
-    const { body: webBody } = await runTool(tools, "xai_web_search", { query: "xAI docs" });
-    assert.deepEqual(webBody.tools, [{ type: "web_search", enable_image_understanding: true }]);
-
-    const { body: xBody } = await runTool(tools, "xai_x_search", { query: "grok", since: "2026-05-01", until: "2026-05-22" });
-    assert.equal(xBody.tools[0].type, "x_search");
-    assert.equal(xBody.tools[0].from_date, "2026-05-01");
-    assert.equal(xBody.tools[0].to_date, "2026-05-22");
-
-    const { body: codeBody } = await runTool(tools, "xai_code_execution", { code: "print(2 + 2)" });
-    assert.deepEqual(codeBody.tools, [{ type: "code_interpreter" }]);
-
-    const { body: imageAnalysisBody } = await runTool(tools, "xai_analyze_image", {
-      image: "https://example.test/cat.png",
-      question: "what is here?",
-    });
-    const imageContent = imageAnalysisBody.input[0].content;
-    assert.equal(imageContent[0].type, "input_image");
-    assert.equal(imageContent[1].type, "input_text");
-
-    const { body: imageGenBody } = await runTool(tools, "xai_generate_image", { prompt: "a crisp diagram" }, /Generated 1 image/);
-    assert.equal(imageGenBody.model, "grok-imagine-image-quality");
-    const imageTool = tools.get("xai_generate_image");
-    assert.equal(Object.hasOwn(imageGenBody, "size"), false, "image generation should not send unsupported size defaults");
-    assert.equal(Object.hasOwn(imageGenBody, "n"), false, "image generation should not send n unless explicitly requested");
-    assert.equal(imageTool.parameters.properties.size, undefined, "image tool schema should not advertise unsupported size");
-    assert.equal(imageTool.parameters.properties.n.default, undefined, "image tool schema should not inject n when omitted");
-    assert.equal(imageTool.parameters.properties.n.minimum, 1, "image tool schema should reject image counts below one");
-    assert.equal(imageTool.parameters.properties.n.maximum, 4, "image tool schema should reject image counts above four");
-
-    const { body: imageBatchBody } = await runTool(
-      tools,
-      "xai_generate_image",
-      { prompt: "three crisp diagrams", n: 3 },
-      /Generated 1 image/,
-    );
-    assert.equal(imageBatchBody.n, 3, "image generation should forward an explicit n value");
-    assert.equal(Object.hasOwn(imageBatchBody, "size"), false, "explicit n requests should still omit size");
-
-    const requestsBeforeUnsupportedSize = requests.length;
-    const unsupportedSizeResult = await imageTool.execute(
-      "call_unsupported_size",
-      { prompt: "a crisp diagram", size: "1024x1024" },
-      undefined,
-      () => {},
-      authContext(),
-    );
-    assert.match(unsupportedSizeResult.content[0].text, /does not support the 'size' parameter/);
-    assert.equal(requests.length, requestsBeforeUnsupportedSize, "unsupported size should fail before sending a request");
-
-    const invalidCountResult = await imageTool.execute(
-      "call_invalid_image_count",
-      { prompt: "a crisp diagram", n: 0 },
-      undefined,
-      () => {},
-      authContext(),
-    );
-    assert.match(invalidCountResult.content[0].text, /must be an integer from 1 to 4/);
-    assert.equal(requests.length, requestsBeforeUnsupportedSize, "invalid n should fail before sending a request");
-
-    const { body: multiAgentBody, result: multiAgentResult } = await runTool(tools, "xai_multi_agent", { query: "latest xAI tools", num_agents: 4 });
-    assert.equal(multiAgentBody.model, "grok-4.20-multi-agent-0309");
-    assert.equal(multiAgentBody.reasoning.effort, "medium");
-    assert.equal(multiAgentResult.details.agents_used, 4);
-    assert.ok(multiAgentBody.tools.some((tool) => tool.type === "web_search"));
-    assert.ok(multiAgentBody.tools.some((tool) => tool.type === "x_search"));
 
     console.log("verify-extension: ok");
   } finally {

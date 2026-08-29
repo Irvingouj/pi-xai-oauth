@@ -78,6 +78,11 @@ Update this file frequently during execution.
 
 **Current branch:** codex/repair-xai-auth
 
+## Phase 12: Native tool ownership
+- [x] Removed the Cursor/Grok shim layer from `pi-xai-oauth`.
+- [x] Kept tool policy ownership in `pi-extensions` and updated package docs/tests.
+- [x] Verified `npm test`, `npm run typecheck`, and `git diff --check`.
+
 ## Phase 8: Post-Repair Tool Verification (this branch)
 - [x] Synced local source to `codex/repair-xai-auth` (and main) via git setup
 - [x] `npm install` + `npm test` ✅ (`verify-extension: ok`)

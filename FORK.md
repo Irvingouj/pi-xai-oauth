@@ -1,26 +1,31 @@
 # Local fork notes
 
-**Intent:** xAI OAuth + **Grok 4.5** (and other API models) for **pi native tools**.
+**Intent:** SuperGrok **cli-chat-proxy only** — no `api.x.ai`, no `xai_*` tools.
 
-## Removed vs upstream npm `pi-xai-oauth`
+## Models (`xai-auth`)
 
-- No Cursor/Grok CLI tool shims (`Grep`, `Shell`, `Read`, `Write`, …)
-- No `grok-composer-2.5-fast` / `grok-build` model entries (CLI-proxy models)
-- No `syncCursorToolShimsForModel` lifecycle hooks
+| Model ID | CLI proxy | Tool shims |
+|----------|-----------|-------------------------------------|
+| `grok-4.6` | ✅ (default) | ❌ (Pi native `grep`/`bash`/`read`) |
+| `grok-4.5` | ✅ | ❌ (Pi native tools) |
+| `grok-build` | ✅ | ❌ (Pi native tools) |
+| `grok-composer-2.5-fast` | ✅ | ❌ (Pi native tools) |
 
-Want Composer / Grok CLI tool surface? Use **Grok CLI**, not this package.
+All traffic: `https://cli-chat-proxy.grok.com/v1` + `x-grok-model-override`.
 
-## Install
+Reasoning (match Grok CLI `xai-org/grok-build`, not omp's xai-oauth strip):
 
-```bash
-pi remove npm:pi-xai-oauth   # if still on npm
-pi install /Users/oujunyi/code/pi-xai-oauth
+- Always `include: ["reasoning.encrypted_content"]` on Responses (`apply_response_defaults`).
+- Replay typed `reasoning` items with `encrypted_content` verbatim. That blob is what restores exact tokens server-side and keeps the prefix cache stable.
+- `status` is output-only; strip it on input. Content parts need `type: "reasoning_text"`.
+- `grok-4.6` efforts: `low` / `medium` / `high` / `xhigh`. `grok-4.5`: `low` / `medium` / `high` (`xhigh` clamps to `high`). `minimal` → `low`. `max` → highest advertised (`xhigh` or `high`).
+- Encrypted-content decrypt failures are a new-session error, never a retry.
+
+OAuth login: `https://auth.x.ai` only.
+
+## Apply
+
+```text
+/reload
+/model grok-4.6
 ```
-
-Settings should list `/Users/oujunyi/code/pi-xai-oauth` (path), not `npm:pi-xai-oauth@…`.
-
-Default model: `grok-4.5` + provider `xai-auth`.
-
-## Coexists with
-
-`~/code/pi-extensions` — policy overrides for built-in `grep` / `bash` / `read` only.
