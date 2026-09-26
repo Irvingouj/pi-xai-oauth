@@ -245,6 +245,8 @@ function verifyGrok46CliProxyPayloadRewrite() {
   assert.equal(rewritten45.reasoning?.effort, "high", "Grok 4.5 must clamp unsupported xhigh to high");
   assert.equal(mapGrokReasoningEffort("grok-4.5", "xhigh"), "high");
   assert.equal(mapGrokReasoningEffort("grok-4.6", "max"), "xhigh");
+  assert.equal(mapGrokReasoningEffort("grok-4.7", "max"), "xhigh");
+  assert.equal(mapGrokReasoningEffort("grok-4.7-build-fast", "xhigh"), "xhigh");
 
   const rewrittenComposer = rewriteXaiResponsesPayload(
     {
@@ -325,6 +327,25 @@ async function verifyCliModelStreamRouting(provider) {
   assert.ok(request45, "Grok 4.5 should stream via cli-chat-proxy");
   assert.equal(request45.body.model, "grok-4.5");
   assert.equal(headerValue(request45.headers, "x-grok-model-override"), "grok-4.5");
+
+  for (const id of ["grok-4.7", "grok-4.7-build-fast"]) {
+    const catalog = provider.models.find((model) => model.id === id);
+    const before = requests.length;
+    const stream = provider.streamSimple(
+      { ...catalog, provider: "xai-auth", api: provider.api, baseUrl: provider.baseUrl },
+      { messages: [{ role: "user", content: "hello", timestamp: Date.now() }] },
+      { apiKey: "oauth-token", sessionId: `session-${id}` },
+    );
+    await stream.result();
+    const request = requests.slice(before).find((entry) => entry.url && urlOriginIs(entry.url, "https://cli-chat-proxy.grok.com"));
+    assert.ok(request, `${id} should stream via cli-chat-proxy`);
+    assert.equal(request.body.model, id);
+    assert.equal(headerValue(request.headers, "x-grok-model-override"), id);
+    assert.ok(
+      (request.body.include || []).includes("reasoning.encrypted_content"),
+      `${id} live streams must request encrypted reasoning like Grok CLI`,
+    );
+  }
 }
 
 async function verifyOAuthCallbackState(provider) {
@@ -456,7 +477,24 @@ async function main() {
     assert.equal(secondLoad.tools.size, tools.size, "extension reloads should register tools on the new pi API object");
     assert.equal(provider.api, "xai-responses");
     assert.equal(provider.baseUrl, "https://cli-chat-proxy.grok.com/v1", "provider base must be Grok CLI proxy");
-    assert.equal(provider.models.length, 4, "CLI proxy catalog: grok-4.6, grok-4.5, grok-build, grok-composer-2.5-fast");
+    assert.equal(
+      provider.models.length,
+      6,
+      "CLI proxy catalog: grok-4.7, grok-4.7-build-fast, grok-4.6, grok-4.5, grok-build, grok-composer-2.5-fast",
+    );
+    const grok47 = provider.models.find((model) => model.id === "grok-4.7");
+    assert.ok(grok47, "grok-4.7 should be registered via cli-chat-proxy");
+    assert.equal(grok47?.name, "Grok 4.7");
+    assert.equal(grok47?.contextWindow, 500_000);
+    assert.equal(grok47?.thinkingLevelMap?.xhigh, "xhigh");
+    assert.equal(grok47?.cost?.input, 2);
+    const grok47Fast = provider.models.find((model) => model.id === "grok-4.7-build-fast");
+    assert.ok(grok47Fast, "grok-4.7-build-fast should be registered via cli-chat-proxy");
+    assert.equal(grok47Fast?.name, "Grok 4.7 Fast");
+    assert.equal(grok47Fast?.contextWindow, 500_000);
+    assert.equal(grok47Fast?.thinkingLevelMap?.xhigh, "xhigh");
+    assert.equal(grok47Fast?.cost?.input, 4);
+    assert.equal(grok47Fast?.cost?.output, 12);
     const grok46 = provider.models.find((model) => model.id === "grok-4.6");
     assert.ok(grok46, "grok-4.6 should be registered via cli-chat-proxy");
     assert.equal(grok46?.contextWindow, 500_000);

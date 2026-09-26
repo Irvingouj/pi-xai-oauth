@@ -8,7 +8,7 @@ import { streamSimpleXaiResponses } from "./xai/responses";
 /**
  * Local fork intent: SuperGrok cli-chat-proxy ONLY.
  *
- * - Models: grok-4.6 (default) + grok-4.5 + grok-build + grok-composer-2.5-fast
+ * - Models: grok-4.7 + grok-4.7-build-fast + grok-4.6 (default) + grok-4.5 + grok-build + grok-composer-2.5-fast
  * - Transport: cli-chat-proxy.grok.com (Grok CLI usage, not paid API)
  * - Reasoning: request + replay `reasoning.encrypted_content` like Grok CLI
  * - Uses pi's native tools

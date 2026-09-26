@@ -7,6 +7,42 @@ import { DEFAULT_XAI_MODEL, XAI_CLI_BASE_URL, XAI_GROK_CLIENT_VERSION } from "./
  */
 export const MODELS = [
   {
+    id: "grok-4.7",
+    name: "Grok 4.7",
+    reasoning: true,
+    input: ["text", "image"],
+    // Short-context rates. At ≥200k prompt tokens xAI bills 2× (same shape as 4.6).
+    cost: { input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0 },
+    contextWindow: 500_000,
+    maxTokens: 131_072,
+    thinkingLevelMap: {
+      off: null,
+      minimal: "low",
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: "xhigh",
+    },
+  },
+  {
+    id: "grok-4.7-build-fast",
+    name: "Grok 4.7 Fast",
+    reasoning: true,
+    input: ["text", "image"],
+    // Same model on faster infra. Grok Build bills 2× the 4.7 short-context rates.
+    cost: { input: 4, output: 12, cacheRead: 1, cacheWrite: 0 },
+    contextWindow: 500_000,
+    maxTokens: 131_072,
+    thinkingLevelMap: {
+      off: null,
+      minimal: "low",
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: "xhigh",
+    },
+  },
+  {
     id: "grok-4.6",
     name: "Grok 4.6",
     reasoning: true,
@@ -69,7 +105,14 @@ export const MODELS = [
   },
 ];
 
-const CLI_PROXY_MODEL_IDS = new Set(["grok-4.6", "grok-4.5", "grok-build", "grok-composer-2.5-fast"]);
+const CLI_PROXY_MODEL_IDS = new Set([
+  "grok-4.7",
+  "grok-4.7-build-fast",
+  "grok-4.6",
+  "grok-4.5",
+  "grok-build",
+  "grok-composer-2.5-fast",
+]);
 
 /** True when this catalog model id is routed via cli-chat-proxy (all registered models). */
 export function isCliProxyRoutedModel(modelId: string): boolean {
@@ -136,6 +179,7 @@ export function grokSupportsReasoningEffort(modelId: string): boolean {
     normalized.startsWith("grok-4.20-multi-agent") ||
     normalized.startsWith("grok-4.3") ||
     normalized.startsWith("grok-4.5") ||
-    normalized.startsWith("grok-4.6")
+    normalized.startsWith("grok-4.6") ||
+    normalized.startsWith("grok-4.7")
   );
 }

@@ -206,10 +206,10 @@ function printNextSteps(nonInteractive = false) {
     console.log(`   ${color("2.", "bold")} Start chatting with Grok 4.6 (already set as default)`);
     console.log(`      ${color("pi", "cyan")}\n`);
   } else {
-    console.log("Grok 4.6 + 4.5 + Build + Composer 2.5 via cli-chat-proxy (no paid api.x.ai) are configured.\n");
+    console.log("Grok 4.7 + 4.7 Fast + 4.6 + 4.5 + Build + Composer 2.5 via cli-chat-proxy (no paid api.x.ai) are configured.\n");
   }
 
-  console.log("Models: grok-4.6 (default), grok-4.5, grok-build, grok-composer-2.5-fast");
+  console.log("Models: grok-4.7, grok-4.7-build-fast, grok-4.6 (default), grok-4.5, grok-build, grok-composer-2.5-fast");
   console.log("Tools: pi native tools (no Cursor shims, no xai_* API tools)\n");
   console.log(`   Update later: ${color("pi update /path/to/pi-xai-oauth", "yellow")}\n`);
 }
